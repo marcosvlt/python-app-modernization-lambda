@@ -1,0 +1,313 @@
+name: 02 - Build and Deploy ECR
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - stage
+      - prod
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'Docker/**'
+  push:
+    branches:
+      - dev
+      - stage
+      - prod
+    paths:
+      - 'Docker/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment'
+        required: true
+        type: choice
+        options:
+          - dev
+          - stage
+          - prod
+          - all
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - create-and-build
+          - build-only
+          - create-only
+          - destroy
+        default: create-and-build
+      aws_region:
+        description: 'AWS Region'
+        required: false
+        type: string
+        default: 'us-east-1'
+
+concurrency:
+  group: ecr-build-deploy-${{ inputs.environment || github.head_ref || github.ref_name }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ${{ inputs.aws_region || 'us-east-1' }}
+
+jobs:
+  determine-environments:
+    name: Determine Target Environments
+    runs-on: ubuntu-latest
+    outputs:
+      environments: ${{ steps.set-envs.outputs.environments }}
+      is_pr: ${{ steps.set-envs.outputs.is_pr }}
+      action: ${{ steps.set-envs.outputs.action }}
+    
+    steps:
+      - name: Set environments
+        id: set-envs
+        run: |
+          IS_PR="false"
+          ACTION="build-only"
+          ENV_NAME=""
+          
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            IS_PR="true"
+            ENV_NAME="${{ github.base_ref }}"
+            ACTION="build-only"
+            echo "environments=[\"$ENV_NAME\"]" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" == "push" ]; then
+            ENV_NAME="${{ github.ref_name }}"
+            ACTION="create-and-build"
+            echo "environments=[\"$ENV_NAME\"]" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            if [ "${{ inputs.environment }}" == "all" ]; then
+              echo 'environments=["dev", "stage", "prod"]' >> $GITHUB_OUTPUT
+              ENV_NAME="all"
+            else
+              echo 'environments=["${{ inputs.environment }}"]' >> $GITHUB_OUTPUT
+              ENV_NAME="${{ inputs.environment }}"
+            fi
+            ACTION="${{ inputs.action }}"
+          else
+            echo 'environments=["dev"]' >> $GITHUB_OUTPUT
+            ENV_NAME="dev"
+          fi
+          
+          echo "is_pr=$IS_PR" >> $GITHUB_OUTPUT
+          echo "action=$ACTION" >> $GITHUB_OUTPUT
+          
+          echo "### Target Environments" >> $GITHUB_STEP_SUMMARY
+          echo "**Event:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** $ENV_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "**Action:** $ACTION" >> $GITHUB_STEP_SUMMARY
+          echo "**Is PR:** $IS_PR" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "$IS_PR" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "ℹ️ **Note:** Docker build will run but images won't be pushed on PRs" >> $GITHUB_STEP_SUMMARY
+          fi
+
+  create-ecr-repositories:
+    name: Create ECR Repository
+    needs: determine-environments
+    if: needs.determine-environments.outputs.action == 'create-and-build' || needs.determine-environments.outputs.action == 'create-only' || needs.determine-environments.outputs.action == 'destroy'
+    runs-on: ubuntu-latest
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.determine-environments.outputs.environments) }}
+      fail-fast: false
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Prepare ECR repo name
+        shell: bash
+        run: |
+          set -eux
+          repo="${GITHUB_REPOSITORY,,}"
+          repo="${repo//\//_}"
+          echo "ECR_REPO_NAME=${repo}" >> $GITHUB_ENV
+          echo "ECR_FULL_NAME=${repo}-${{ matrix.environment }}" >> $GITHUB_ENV
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          terraform_wrapper: false
+      
+      - name: Terraform Init
+        working-directory: ./Terraform/environments/${{ matrix.environment }}/build
+        run: terraform init -var "repository_name=${{ env.ECR_REPO_NAME }}"
+      
+      - name: Terraform Plan
+        if: needs.determine-environments.outputs.action != 'destroy'
+        working-directory: ./Terraform/environments/${{ matrix.environment }}/build
+        run: terraform plan -out=tfplan -var "repository_name=${{ env.ECR_REPO_NAME }}"
+      
+      - name: Terraform Apply
+        if: needs.determine-environments.outputs.action != 'destroy'
+        working-directory: ./Terraform/environments/${{ matrix.environment }}/build
+        run: |
+          terraform apply -auto-approve tfplan
+          
+          echo "### ✅ ECR Repository Created" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** ${{ env.ECR_FULL_NAME }}" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Terraform Destroy
+        if: needs.determine-environments.outputs.action == 'destroy'
+        working-directory: ./Terraform/environments/${{ matrix.environment }}/build
+        run: |
+          terraform destroy -auto-approve -var "repository_name=${{ env.ECR_REPO_NAME }}"
+          
+          echo "### 🗑️ ECR Repository Destroyed" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+      
+      - name: Get Repository URL
+        if: needs.determine-environments.outputs.action != 'destroy'
+        id: repo-url
+        run: |
+          REPO_URL=$(aws ecr describe-repositories \
+            --repository-names "${{ env.ECR_FULL_NAME }}" \
+            --region ${{ env.AWS_REGION }} \
+            --query 'repositories[0].repositoryUri' \
+            --output text)
+          
+          echo "repository_url=$REPO_URL" >> $GITHUB_OUTPUT
+          echo "**Repository URI:** $REPO_URL" >> $GITHUB_STEP_SUMMARY
+
+  build-and-push-images:
+    name: Build and Push Docker Image
+    needs: [determine-environments, create-ecr-repositories]
+    if: |
+      always() &&
+      (needs.determine-environments.outputs.action == 'create-and-build' || needs.determine-environments.outputs.action == 'build-only') &&
+      (needs.create-ecr-repositories.result == 'success' || needs.create-ecr-repositories.result == 'skipped') &&
+      github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    
+    permissions:
+      id-token: write
+      contents: read
+    
+    strategy:
+      matrix:
+        environment: ${{ fromJson(needs.determine-environments.outputs.environments) }}
+      fail-fast: false
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Prepare ECR repo name
+        shell: bash
+        run: |
+          set -eux
+          repo="${GITHUB_REPOSITORY,,}"
+          repo="${repo//\//_}"
+          echo "ECR_REPO_NAME=${repo}-${{ matrix.environment }}" >> $GITHUB_ENV
+          echo "IMAGE_TAG=lambda-fipe-${{ matrix.environment }}" >> $GITHUB_ENV
+          
+          # Generate semantic version: YYYY.MM.DD-HHmmss-shortsha
+          VERSION=$(date -u +'%Y.%m.%d-%H%M%S')-${GITHUB_SHA::7}
+          echo "VERSION=${VERSION}" >> $GITHUB_ENV
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Check if ECR repository exists
+        id: check-ecr
+        run: |
+          if aws ecr describe-repositories \
+            --repository-names "${{ env.ECR_REPO_NAME }}" \
+            --region ${{ env.AWS_REGION }} \
+            > /dev/null 2>&1; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "✅ ECR repository exists" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+            echo "❌ ECR repository does not exist" >> $GITHUB_STEP_SUMMARY
+            exit 1
+          fi
+      
+      - name: Build Docker image
+        if: steps.check-ecr.outputs.exists == 'true'
+        working-directory: ./Docker
+        run: |
+          docker build \
+            --build-arg BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ') \
+            --build-arg VCS_REF=${{ github.sha }} \
+            --build-arg VERSION=${{ env.VERSION }} \
+            -t ${{ env.ECR_REPO_NAME }}:${{ env.IMAGE_TAG }}-${{ env.VERSION }} \
+            .
+      
+      - name: Tag and Push Docker image
+        if: steps.check-ecr.outputs.exists == 'true'
+        run: |
+          REGISTRY="${{ steps.login-ecr.outputs.registry }}"
+          REPO="${{ env.ECR_REPO_NAME }}"
+          TAG="${{ env.IMAGE_TAG }}"
+          VERSION="${{ env.VERSION }}"
+          
+          # Tag and push with combined environment-version tag
+          docker tag ${REPO}:${TAG}-${VERSION} ${REGISTRY}/${REPO}:${TAG}-${VERSION}
+          docker push ${REGISTRY}/${REPO}:${TAG}-${VERSION}
+
+          echo "### 🐳 Docker Image Pushed" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ matrix.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Repository:** ${REPO}" >> $GITHUB_STEP_SUMMARY
+          echo "**Tag:** ${TAG}-${VERSION}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Image URI:** ${REGISTRY}/${REPO}:${TAG}-${VERSION}" >> $GITHUB_STEP_SUMMARY
+
+  summary:
+    name: Deployment Summary
+    needs: [determine-environments, create-ecr-repositories, build-and-push-images]
+    if: always()
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## 📊 ECR Build and Deploy Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Event:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Action:** ${{ needs.determine-environments.outputs.action }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Is PR:** ${{ needs.determine-environments.outputs.is_pr }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Region:** ${{ env.AWS_REGION }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** @${{ github.actor }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Job Results" >> $GITHUB_STEP_SUMMARY
+          echo "- **Create ECR:** ${{ needs.create-ecr-repositories.result }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build & Push:** ${{ needs.build-and-push-images.result }}" >> $GITHUB_STEP_SUMMARY
+          
+          if [ "${{ needs.determine-environments.outputs.is_pr }}" == "true" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ℹ️ Pull Request Build" >> $GITHUB_STEP_SUMMARY
+            echo "Docker images are built but not pushed on PRs." >> $GITHUB_STEP_SUMMARY
+            echo "Images will be pushed after PR is merged." >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.build-and-push-images.result }}" == "success" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ✅ All Operations Completed Successfully!" >> $GITHUB_STEP_SUMMARY
+          elif [ "${{ needs.create-ecr-repositories.result }}" == "failure" ] || [ "${{ needs.build-and-push-images.result }}" == "failure" ]; then
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### ❌ Some Operations Failed" >> $GITHUB_STEP_SUMMARY
+            echo "Check the job logs above for details." >> $GITHUB_STEP_SUMMARY
+          fi

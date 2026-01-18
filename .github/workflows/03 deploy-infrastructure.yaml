@@ -1,0 +1,391 @@
+name: 03 - Deploy Infrastructure
+
+on:
+  pull_request:
+    branches:
+      - dev
+      - stage
+      - prod
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'Terraform/environments/**'
+      - 'Terraform/modules/**'
+  push:
+    branches:
+      - dev
+      - stage
+      - prod
+    paths:
+      - 'Terraform/environments/**'
+      - 'Terraform/modules/**'
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Target environment (overrides branch)'
+        required: false
+        type: choice
+        options:
+          - dev
+          - stage
+          - prod
+      action:
+        description: 'Action to perform'
+        required: true
+        type: choice
+        options:
+          - plan
+          - apply
+          - destroy
+        default: plan
+      aws_region:
+        description: 'AWS Region'
+        required: false
+        type: string
+        default: 'us-east-1'
+      skip_image_check:
+        description: 'Skip Docker image build check'
+        required: false
+        type: boolean
+        default: false
+  workflow_call:
+    inputs:
+      environment:
+        required: true
+        type: string
+      action:
+        required: false
+        type: string
+        default: 'apply'
+      aws_region:
+        required: false
+        type: string
+        default: 'us-east-1'
+
+concurrency:
+  group: deploy-${{ inputs.environment || github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  check-image-build:
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request' && (github.event_name != 'workflow_dispatch' || !inputs.skip_image_check)
+    
+    permissions:
+      actions: read
+      contents: read
+    
+    outputs:
+      should_proceed: ${{ steps.check.outputs.should_proceed }}
+    
+    steps:
+      - name: Determine environment
+        id: determine-env
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "environment=${{ inputs.environment }}" >> $GITHUB_OUTPUT
+          elif [ "${{ github.event_name }}" == "workflow_call" ]; then
+            echo "environment=${{ inputs.environment }}" >> $GITHUB_OUTPUT
+          else
+            echo "environment=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+      
+      - name: Check if Docker build workflow completed
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const environment = '${{ steps.determine-env.outputs.environment }}';
+            const currentSha = '${{ github.sha }}';
+            
+            // Get workflow runs for the current commit
+            const { data: workflows } = await github.rest.actions.listRepoWorkflows({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            
+            // Find the "Build and Push Docker Images" workflow
+            const buildWorkflow = workflows.workflows.find(w => 
+              w.name === '02 - Build and Deploy ECR'
+            );
+            
+            if (!buildWorkflow) {
+              console.log('⚠️ Docker build workflow not found, proceeding anyway');
+              core.setOutput('should_proceed', 'true');
+              return;
+            }
+            
+            // Get recent runs of the build workflow
+            const { data: runs } = await github.rest.actions.listWorkflowRuns({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              workflow_id: buildWorkflow.id,
+              head_sha: currentSha,
+              per_page: 10
+            });
+            
+            if (runs.workflow_runs.length === 0) {
+              console.log('⚠️ No Docker build runs found for this commit');
+              console.log('Checking if Docker files were modified...');
+              
+              // Check if Docker files were modified in this commit
+              const { data: commit } = await github.rest.repos.getCommit({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: currentSha
+              });
+              
+              const dockerFilesModified = commit.files.some(file => 
+                file.filename.startsWith('Docker/')
+              );
+              
+              if (dockerFilesModified) {
+                core.setFailed('❌ Docker files were modified but no build workflow run found. Please run the Docker build workflow first.');
+                core.setOutput('should_proceed', 'false');
+                return;
+              } else {
+                console.log('✅ Docker files not modified, safe to proceed');
+                core.setOutput('should_proceed', 'true');
+                return;
+              }
+            }
+            
+            // Check the status of the most recent run
+            const latestRun = runs.workflow_runs[0];
+            console.log(`Latest build workflow run: ${latestRun.status} - ${latestRun.conclusion}`);
+            
+            if (latestRun.status === 'completed') {
+              if (latestRun.conclusion === 'success' || latestRun.conclusion === 'skipped') {
+                console.log('✅ Docker build completed successfully or was skipped');
+                core.setOutput('should_proceed', 'true');
+              } else {
+                core.setFailed(`❌ Docker build failed with conclusion: ${latestRun.conclusion}`);
+                core.setOutput('should_proceed', 'false');
+              }
+            } else {
+              console.log('⏳ Docker build is still running, waiting...');
+              core.setOutput('should_proceed', 'wait');
+            }
+      
+      - name: Wait for Docker build to complete
+        if: steps.check.outputs.should_proceed == 'wait'
+        uses: actions/github-script@v7
+        timeout-minutes: 30
+        with:
+          script: |
+            const currentSha = '${{ github.sha }}';
+            
+            const { data: workflows } = await github.rest.actions.listRepoWorkflows({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+            });
+            
+            const buildWorkflow = workflows.workflows.find(w => 
+              w.name === '02 - Build and Deploy ECR'
+            );
+            
+            let attempts = 0;
+            const maxAttempts = 60; // 30 minutes (30 seconds * 60)
+            
+            while (attempts < maxAttempts) {
+              attempts++;
+              
+              const { data: runs } = await github.rest.actions.listWorkflowRuns({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: buildWorkflow.id,
+                head_sha: currentSha,
+                per_page: 1
+              });
+              
+              if (runs.workflow_runs.length > 0) {
+                const run = runs.workflow_runs[0];
+                console.log(`[Attempt ${attempts}] Status: ${run.status} - Conclusion: ${run.conclusion}`);
+                
+                if (run.status === 'completed') {
+                  if (run.conclusion === 'success' || run.conclusion === 'skipped') {
+                    console.log('✅ Docker build completed successfully!');
+                    return;
+                  } else {
+                    core.setFailed(`❌ Docker build failed with conclusion: ${run.conclusion}`);
+                    return;
+                  }
+                }
+              }
+              
+              console.log('⏳ Still waiting for Docker build to complete...');
+              await new Promise(resolve => setTimeout(resolve, 30000)); // Wait 30 seconds
+            }
+            
+            core.setFailed('❌ Timeout waiting for Docker build to complete');
+
+  deploy:
+    needs: [check-image-build]
+    if: |
+      always() && 
+      (needs.check-image-build.result == 'success' || 
+       needs.check-image-build.result == 'skipped' ||
+       github.event_name == 'pull_request')
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment || (github.event_name == 'pull_request' && github.base_ref || github.ref_name) }}
+    
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+      
+    
+    steps:
+      - name: Determine environment and action
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" == "pull_request" ]; then
+            ENV="${{ github.base_ref }}"
+            ACTION="plan"
+          elif [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            ENV="${{ inputs.environment }}"
+            ACTION="${{ inputs.action }}"
+          elif [ "${{ github.event_name }}" == "workflow_call" ]; then
+            ENV="${{ inputs.environment }}"
+            ACTION="${{ inputs.action }}"
+          else
+            # Push event - use branch name and auto-apply
+            ENV="${{ github.ref_name }}"
+            ACTION="apply"
+          fi
+          echo "environment=$ENV" >> $GITHUB_OUTPUT
+          echo "action=$ACTION" >> $GITHUB_OUTPUT
+      
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.ROLE_ARN }}
+          aws-region: ${{ inputs.aws_region || 'us-east-1' }}
+
+      - name: prepare ECR repo name based on the Github repository
+        shell: bash
+        run: |
+          set -eux
+          # lowercase the name
+          repo="${GITHUB_REPOSITORY,,}"
+
+          # replace / with _
+          echo "ECR_REPO_NAME=${repo//\//_}" >> $GITHUB_ENV
+
+      
+      # - name: Verify Docker image exists in ECR
+      #   if: steps.env.outputs.action == 'apply' && github.event_name != 'pull_request'
+      #   run: |
+      #     set -e
+          
+      #     # Get ECR repository name
+      #     REPO_NAME="${GITHUB_REPOSITORY,,}"
+      #     REPO_NAME="${REPO_NAME//\//_}"
+      #     ECR_REPO="${REPO_NAME}-${{ steps.env.outputs.environment }}"
+      #     IMAGE_TAG="lambda-fipe-${{ steps.env.outputs.environment }}"
+          
+      #     echo "Checking for image: ${ECR_REPO}:${IMAGE_TAG}"
+          
+      #     # Check if image exists
+      #     if aws ecr describe-images \
+      #       --repository-name "${ECR_REPO}" \
+      #       --image-ids imageTag="${IMAGE_TAG}" \
+      #       --region ${{ inputs.aws_region || 'us-east-1' }} \
+      #       > /dev/null 2>&1; then
+      #       echo "✅ Docker image found in ECR"
+      #     else
+      #       echo "❌ Docker image not found in ECR"
+      #       echo "Please ensure the Docker build workflow has completed successfully"
+      #       exit 1
+      #     fi
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.6.0
+          terraform_wrapper: false
+      
+      - name: Terraform Init
+        working-directory: ./Terraform/environments/${{ steps.env.outputs.environment }}
+        run: terraform init
+      
+      - name: Terraform Validate
+        working-directory: ./Terraform/environments/${{ steps.env.outputs.environment }}
+        run: terraform validate
+      
+      - name: Terraform Plan
+        id: plan
+        working-directory: ./Terraform/environments/${{ steps.env.outputs.environment }}
+        run: terraform plan -out=tfplan -var "repository_name=${{ env.ECR_REPO_NAME }}"        
+      
+      - name: Comment PR with Plan
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const output = `### Terraform Plan for \`${{ steps.env.outputs.environment }}\` 📋
+            
+            <details><summary>Show Plan</summary>
+            
+            \`\`\`terraform
+            ${{ steps.plan.outputs.plan_output }}
+            \`\`\`
+            
+            </details>
+            
+            **Environment:** ${{ steps.env.outputs.environment }}
+            **Triggered by:** @${{ github.actor }}
+            **Source Branch:** ${{ github.head_ref }}
+            **Target Branch:** ${{ github.base_ref }}
+            
+            ⚠️ **Changes will be applied after PR is merged.**`;
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: output
+            })
+      
+      - name: Terraform Apply
+        if: steps.env.outputs.action == 'apply' && github.event_name != 'pull_request'
+        working-directory: ./Terraform/environments/${{ steps.env.outputs.environment }}
+        run: terraform apply -auto-approve tfplan
+      
+      - name: Terraform Destroy
+        if: steps.env.outputs.action == 'destroy'
+        working-directory: ./Terraform/environments/${{ steps.env.outputs.environment }}
+        run: terraform destroy -auto-approve -var "repository_name=${{ env.ECR_REPO_NAME }}" 
+      
+      - name: Get Terraform Outputs
+        if: steps.env.outputs.action == 'apply' && github.event_name != 'pull_request'
+        id: tf_output
+        working-directory: ./Terraform/environments/${{ steps.env.outputs.environment }}
+        run: |
+          echo "### Infrastructure Deployed Successfully! 🎉" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ steps.env.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** ${{ github.sha }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Outputs:**" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          terraform output >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+      
+      - name: PR Summary
+        if: github.event_name == 'pull_request'
+        run: |
+          echo "### Terraform Plan Completed! 📋" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Environment:** ${{ steps.env.outputs.environment }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Action:** Plan only (no changes applied)" >> $GITHUB_STEP_SUMMARY
+          echo "**Source Branch:** ${{ github.head_ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Target Branch:** ${{ github.base_ref }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "✅ Plan has been posted as a PR comment" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ Changes will be applied automatically after PR is merged" >> $GITHUB_STEP_SUMMARY
