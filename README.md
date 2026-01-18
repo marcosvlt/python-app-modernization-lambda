@@ -1,5 +1,3 @@
-# 🚀 Enacom Challenge - FIPE Data Processor
-
 A serverless Modernized AWS solution that processes FIPE vehicle data using containerized Lambda functions triggered by S3 events. The system function processes FIPE CSV files and performs data cleaning operations:
 
 Validates required fields (codigoFipe, marca, modelo, anoModelo, valor)
